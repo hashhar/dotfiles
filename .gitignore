@@ -1,0 +1,2 @@
+# Private config files - copy from *.example (remove the suffix) and fill in real values
+dot_claude/skills/*/context.md
