@@ -1,0 +1,32 @@
+# Work Pulse Context
+
+Copy this file to `context.md` in the same directory and fill in your real values.
+`context.md` is gitignored and never checked in.
+
+## GitHub
+- Username: your-github-username
+- Work org: your-company-org  (e.g. acme-corp)
+- OSS / work-adjacent orgs: org-one, org-two
+
+## Jira
+- Site: yourcompany.atlassian.net
+- Projects: PROJECT1, PROJECT2
+
+## Paths
+- Repos root: ~/path/to/repos  (all local git repos live under here)
+- Obsidian daily notes: ~/path/to/vault/Periodic/Daily
+
+## Slack
+- Your user ID: UXXXXXXXXXX  (find in your Slack profile → "Member ID")
+- Team channels: #eng-team-yourteam, #xfn-team-yourteam, #another-channel
+
+## Confluence
+- Team page: https://yourcompany.atlassian.net/wiki/spaces/SPACE/pages/PAGEID/Team+Name
+- Sprint board: https://yourcompany.atlassian.net/jira/software/c/projects/ENG/boards/NNN
+- Roadmap: https://yourcompany.atlassian.net/jira/polaris/projects/RM/ideas/view/NNNNNNN
+
+## Team
+- Manager: Your Manager (EM)
+- PM: Your PM
+- T2 Stakeholders: PM Two, PM Three
+- Teammates: Teammate One, Teammate Two, Teammate Three, Teammate Four
