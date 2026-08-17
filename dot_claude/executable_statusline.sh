@@ -60,12 +60,11 @@ if git_cmd rev-parse --git-dir >/dev/null 2>&1; then
   MODIFIED=$(git_cmd diff --numstat 2>/dev/null | wc -l | tr -d ' ')
   UNTRACKED=$(git_cmd ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')
 
-  # Ahead / behind upstream
+  # Ahead / behind upstream in one call (format: "behind\tahead")
   AHEAD=0; BEHIND=0
-  UPSTREAM=$(git_cmd rev-parse --abbrev-ref '@{upstream}' 2>/dev/null)
-  if [ -n "$UPSTREAM" ]; then
-    AHEAD=$(git_cmd rev-list --count '@{upstream}..HEAD' 2>/dev/null)
-    BEHIND=$(git_cmd rev-list --count 'HEAD..@{upstream}' 2>/dev/null)
+  if rev_info=$(git_cmd rev-list --left-right --count '@{upstream}...HEAD' 2>/dev/null); then
+    BEHIND="${rev_info%%	*}"   # text before tab
+    AHEAD="${rev_info##*	}"    # text after tab
   fi
 
   if [ "$STAGED" -eq 0 ] && [ "$MODIFIED" -eq 0 ] && [ "$UNTRACKED" -eq 0 ]; then
@@ -116,7 +115,7 @@ if [ -n "$RATE_LIMIT_7D_USED_PERCENT" ]; then
   RL_7D_INT=$(printf '%.0f' "$RATE_LIMIT_7D_USED_PERCENT")
   [ -n "$LINE3" ] && LINE3+=" ${CLR_DIM}|${CLR_RESET} "
   LINE3+="${CLR_DIM}7d:${CLR_RESET} $(rl_color "$RL_7D_INT")${RL_7D_INT}%${CLR_RESET}"
-  [ -n "$RATE_LIMIT_7D_RESETS_AT" ] && LINE3+=" ${CLR_DIM}resets $(date -r "$RATE_LIMIT_7D_RESETS_AT" +"%H:%M")${CLR_RESET}"
+  [ -n "$RATE_LIMIT_7D_RESETS_AT" ] && LINE3+=" ${CLR_DIM}resets $(date -r "$RATE_LIMIT_7D_RESETS_AT" +"%a %H:%M")${CLR_RESET}"
 fi
 
 # --- Line 4 (optional): worktree ---
