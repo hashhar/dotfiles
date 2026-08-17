@@ -1,2 +1,10 @@
 # Private config files - copy from *.example (remove the suffix) and fill in real values
 dot_claude/skills/*/context.md
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Python bytecode
+__pycache__/
+*.pyc

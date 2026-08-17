@@ -1,0 +1,476 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# branch-cleanup - classify local branches by PR status, optionally clean up stale ones.
+# Default: report only. Use --delete to actually remove branches.
+
+# --- Defaults ---
+OPT_DELETE=false
+OPT_YES=false
+OPT_REMOTE=false
+OPT_WORKTREES=false
+OPT_JSON=false
+
+# --- Color support ---
+use_color() {
+    [[ -z "${NO_COLOR:-}" ]] && [[ -t 1 ]]
+}
+
+if use_color; then
+    C_RED='\033[31m' C_GREEN='\033[32m' C_YELLOW='\033[33m'
+    C_CYAN='\033[36m' C_DIM='\033[2m' C_BOLD='\033[1m' C_RESET='\033[0m'
+else
+    C_RED='' C_GREEN='' C_YELLOW='' C_CYAN='' C_DIM='' C_BOLD='' C_RESET=''
+fi
+
+usage() {
+    cat <<'EOF'
+Usage: branch-cleanup [OPTIONS]
+
+Classify local git branches by their GitHub PR status.
+Default: report only - nothing is deleted.
+
+Options:
+  --delete              Actually delete stale/orphan branches (prompts per item)
+  --yes                 Skip deletion prompts (requires --delete)
+  --include-worktrees   Also report on git worktrees (deletability, dirtiness)
+  --remote              Also check remote tracking branches
+  --json                Output as JSON
+  --help                Show this help
+
+Examples:
+  branch-cleanup                          # Report branch status
+  branch-cleanup --include-worktrees      # Include worktree status
+  branch-cleanup --json                   # Machine-readable output
+  branch-cleanup --delete                 # Delete stale branches (with prompts)
+  branch-cleanup --delete --yes           # Delete stale branches (no prompts)
+EOF
+}
+
+# --- Argument parsing ---
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --delete)       OPT_DELETE=true ;;
+        --yes)          OPT_YES=true ;;
+        --remote)       OPT_REMOTE=true ;;
+        --include-worktrees) OPT_WORKTREES=true ;;
+        --json)         OPT_JSON=true ;;
+        --help|-h)      usage; exit 0 ;;
+        *)              echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    esac
+    shift
+done
+
+if $OPT_YES && ! $OPT_DELETE; then
+    echo "Error: --yes requires --delete" >&2
+    exit 1
+fi
+
+# --- Verify prerequisites ---
+if ! git rev-parse --is-inside-work-tree &>/dev/null; then
+    echo "Error: not inside a git repository" >&2
+    exit 1
+fi
+
+if ! command -v gh &>/dev/null; then
+    echo "Error: gh (GitHub CLI) is not installed" >&2
+    exit 1
+fi
+
+# --- Detect main branch ---
+MAIN_BRANCH=""
+for candidate in main master; do
+    if git rev-parse --verify "$candidate" &>/dev/null; then
+        MAIN_BRANCH="$candidate"
+        break
+    fi
+done
+if [[ -z "$MAIN_BRANCH" ]]; then
+    echo "Error: could not find main or master branch" >&2
+    exit 1
+fi
+
+CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
+
+# --- Batch-fetch all PRs for this repo ---
+declare -A PR_MAP_NUM PR_MAP_STATE PR_MAP_TITLE
+
+load_pr_map() {
+    local pr_json
+    pr_json=$(gh pr list --state all --limit 5000 --json headRefName,number,state,title 2>/dev/null || echo "[]")
+    local pr_count
+    pr_count=$(echo "$pr_json" | jq 'length')
+    if [[ "$pr_count" -ge 5000 ]]; then
+        echo "Warning: fetched 5000 PRs (the limit) - some branches may be misclassified. Consider narrowing with gh pr list filters." >&2
+    fi
+
+    while IFS=$'\t' read -r head num state title; do
+        [[ -z "$head" ]] && continue
+        # If multiple PRs for same branch, prefer OPEN > MERGED > CLOSED
+        local existing="${PR_MAP_STATE[$head]:-}"
+        if [[ -z "$existing" ]] \
+            || [[ "$state" == "OPEN" ]] \
+            || { [[ "$state" == "MERGED" ]] && [[ "$existing" != "OPEN" ]]; }; then
+            PR_MAP_NUM[$head]="$num"
+            PR_MAP_STATE[$head]="$state"
+            PR_MAP_TITLE[$head]="$title"
+        fi
+    done < <(echo "$pr_json" | jq -r '.[] | [.headRefName, (.number|tostring), .state, .title] | @tsv')
+}
+
+load_pr_map
+
+# --- Classify a branch ---
+# Sets: CLASS, CLASS_DETAIL
+classify_branch() {
+    local branch="$1"
+    local pr_state="${PR_MAP_STATE[$branch]:-}"
+    local pr_num="${PR_MAP_NUM[$branch]:-}"
+    local pr_title="${PR_MAP_TITLE[$branch]:-}"
+
+    if [[ -n "$pr_state" ]]; then
+        case "$pr_state" in
+            MERGED) CLASS="stale-merged"; CLASS_DETAIL="PR #${pr_num} \"${pr_title}\"" ;;
+            CLOSED) CLASS="stale-closed"; CLASS_DETAIL="PR #${pr_num} \"${pr_title}\"" ;;
+            OPEN)   CLASS="active";       CLASS_DETAIL="PR #${pr_num} \"${pr_title}\" (open)" ;;
+        esac
+        return
+    fi
+
+    # No PR found - check if ahead of main
+    local ahead
+    ahead=$(git rev-list --count "${MAIN_BRANCH}..${branch}" 2>/dev/null || echo "0")
+    local has_remote
+    has_remote=$(git config --get "branch.${branch}.remote" 2>/dev/null || echo "")
+
+    if [[ "$ahead" -gt 0 && -z "$has_remote" ]]; then
+        CLASS="unpushed"
+        CLASS_DETAIL="${ahead} commits ahead of ${MAIN_BRANCH}, no remote"
+    elif [[ "$ahead" -gt 0 ]]; then
+        CLASS="orphan"
+        CLASS_DETAIL="${ahead} commits ahead of ${MAIN_BRANCH}"
+    else
+        CLASS="orphan"
+        CLASS_DETAIL="even with ${MAIN_BRANCH}"
+    fi
+}
+
+# --- Collect worktree branch names first (needed to annotate local branches) ---
+declare -A WORKTREE_BRANCH_PATH  # branch -> worktree path
+
+collect_worktree_branches() {
+    local wt_path="" wt_branch=""
+    local main_wt
+    main_wt=$(git rev-parse --show-toplevel 2>/dev/null || echo "")
+
+    while IFS= read -r line; do
+        if [[ "$line" == "worktree "* ]]; then
+            if [[ -n "$wt_path" && "$wt_path" != "$main_wt" && -n "$wt_branch" ]]; then
+                WORKTREE_BRANCH_PATH[$wt_branch]="$wt_path"
+            fi
+            wt_path="${line#worktree }"
+            wt_branch=""
+        elif [[ "$line" == "branch "* ]]; then
+            wt_branch="${line#branch refs/heads/}"
+        fi
+    done < <(git worktree list --porcelain; echo "")
+
+    if [[ -n "$wt_path" && "$wt_path" != "$main_wt" && -n "$wt_branch" ]]; then
+        WORKTREE_BRANCH_PATH[$wt_branch]="$wt_path"
+    fi
+}
+
+collect_worktree_branches
+
+# --- Collect local branches (excluding worktree branches) ---
+declare -a BRANCHES_stale_merged=() BRANCHES_stale_closed=() BRANCHES_active=()
+declare -a BRANCHES_orphan=() BRANCHES_unpushed=()
+declare -A BRANCH_DETAIL
+MAX_BRANCH_WIDTH=0
+
+collect_local_branches() {
+    while IFS= read -r branch; do
+        [[ -z "$branch" ]] && continue
+        [[ "$branch" == "$MAIN_BRANCH" ]] && continue
+        [[ "$branch" == "$CURRENT_BRANCH" ]] && continue
+
+        # Skip branches checked out in worktrees - they appear in the worktree section
+        if [[ -n "${WORKTREE_BRANCH_PATH[$branch]:-}" ]]; then
+            continue
+        fi
+
+        classify_branch "$branch"
+        BRANCH_DETAIL[$branch]="$CLASS_DETAIL"
+        [[ ${#branch} -gt $MAX_BRANCH_WIDTH ]] && MAX_BRANCH_WIDTH=${#branch}
+
+        case "$CLASS" in
+            stale-merged) BRANCHES_stale_merged+=("$branch") ;;
+            stale-closed) BRANCHES_stale_closed+=("$branch") ;;
+            active)       BRANCHES_active+=("$branch") ;;
+            orphan)       BRANCHES_orphan+=("$branch") ;;
+            unpushed)     BRANCHES_unpushed+=("$branch") ;;
+        esac
+    done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+}
+
+collect_local_branches
+
+# --- Worktree detail collection (only with --include-worktrees) ---
+declare -a WORKTREE_BRANCHES=()
+declare -A WT_CLASS WT_DETAIL WT_DIRTY WT_DELETABLE
+
+collect_worktree_details() {
+    for branch in "${!WORKTREE_BRANCH_PATH[@]}"; do
+        local path="${WORKTREE_BRANCH_PATH[$branch]}"
+        local dirty_info="" deletable="yes"
+
+        local status_output
+        status_output=$(git -C "$path" status --porcelain 2>/dev/null || true)
+        if [[ -n "$status_output" ]]; then
+            local dirty_count=0 untracked_count=0
+            while IFS= read -r _line; do
+                dirty_count=$((dirty_count + 1))
+                [[ "$_line" == "??"* ]] && untracked_count=$((untracked_count + 1))
+            done <<< "$status_output"
+            dirty_info="${dirty_count} changes"
+            if [[ "$untracked_count" -gt 0 ]]; then
+                dirty_info="${dirty_info} (${untracked_count} untracked)"
+            fi
+            deletable="no"
+        fi
+
+        classify_branch "$branch"
+
+        if [[ "$CLASS" == "active" || "$CLASS" == "unpushed" ]]; then
+            deletable="no"
+        fi
+
+        [[ ${#branch} -gt $MAX_BRANCH_WIDTH ]] && MAX_BRANCH_WIDTH=${#branch}
+        WORKTREE_BRANCHES+=("$branch")
+        WT_CLASS[$branch]="$CLASS"
+        WT_DETAIL[$branch]="$CLASS_DETAIL"
+        WT_DIRTY[$branch]="$dirty_info"
+        WT_DELETABLE[$branch]="$deletable"
+    done
+}
+
+if $OPT_WORKTREES; then
+    collect_worktree_details
+fi
+
+# --- Remote branch collection ---
+declare -a REMOTE_stale_merged=() REMOTE_stale_closed=() REMOTE_active=()
+declare -a REMOTE_orphan=()
+declare -A REMOTE_DETAIL
+
+collect_remote_branches() {
+    while IFS= read -r ref; do
+        [[ -z "$ref" ]] && continue
+        local branch="${ref#origin/}"
+        [[ "$branch" == "HEAD" ]] && continue
+        [[ "$branch" == "$MAIN_BRANCH" ]] && continue
+
+        classify_branch "$branch"
+        REMOTE_DETAIL[$ref]="$CLASS_DETAIL"
+        [[ ${#ref} -gt $MAX_BRANCH_WIDTH ]] && MAX_BRANCH_WIDTH=${#ref}
+
+        case "$CLASS" in
+            stale-merged) REMOTE_stale_merged+=("$ref") ;;
+            stale-closed) REMOTE_stale_closed+=("$ref") ;;
+            active)       REMOTE_active+=("$ref") ;;
+            orphan|unpushed) REMOTE_orphan+=("$ref") ;;
+        esac
+    done < <(git branch -r --format='%(refname:short)' 2>/dev/null)
+}
+
+if $OPT_REMOTE; then
+    collect_remote_branches
+fi
+
+# --- JSON output ---
+output_json() {
+    {
+        for category in stale-merged stale-closed active orphan unpushed; do
+            local -n arr="BRANCHES_${category//-/_}"
+            for branch in "${arr[@]+"${arr[@]}"}"; do
+                jq -n --arg name "$branch" --arg category "$category" \
+                    --arg detail "${BRANCH_DETAIL[$branch]}" \
+                    '{_t:"local", name:$name, category:$category, detail:$detail}'
+            done
+        done
+
+        for branch in "${WORKTREE_BRANCHES[@]+"${WORKTREE_BRANCHES[@]}"}"; do
+            local del_bool="false"
+            [[ "${WT_DELETABLE[$branch]}" == "yes" ]] && del_bool="true"
+            jq -n --arg path "${WORKTREE_BRANCH_PATH[$branch]}" --arg branch "$branch" \
+                --arg category "${WT_CLASS[$branch]}" --arg detail "${WT_DETAIL[$branch]}" \
+                --arg dirty "${WT_DIRTY[$branch]}" --argjson deletable "$del_bool" \
+                '{_t:"wt", path:$path, branch:$branch, category:$category, detail:$detail, dirty:$dirty, deletable:$deletable}'
+        done
+
+        for category in stale-merged stale-closed active orphan; do
+            local -n rarr="REMOTE_${category//-/_}"
+            for ref in "${rarr[@]+"${rarr[@]}"}"; do
+                jq -n --arg name "$ref" --arg category "$category" \
+                    --arg detail "${REMOTE_DETAIL[$ref]}" \
+                    '{_t:"remote", name:$name, category:$category, detail:$detail}'
+            done
+        done
+    } | jq -s '{
+        local_branches:  [.[] | select(._t=="local")  | del(._t)],
+        worktrees:       [.[] | select(._t=="wt")     | del(._t)],
+        remote_branches: [.[] | select(._t=="remote") | del(._t)]
+    }'
+}
+
+# --- Human-readable output ---
+
+print_section() {
+    local header="$1" color="$2" detail_map="$3"
+    shift 3
+    local -a items=("$@")
+    [[ ${#items[@]} -eq 0 ]] && return
+
+    echo -e "\n${color}${C_BOLD}${header}${C_RESET}"
+    for item in "${items[@]}"; do
+        local -n _detail_ref="$detail_map"
+        local detail="${_detail_ref[$item]:-}"
+        printf "  %-${COL_WIDTH}s" "$item"
+        if [[ -n "$detail" ]]; then
+            echo -e "  ${C_DIM}${detail}${C_RESET}"
+        else
+            echo
+        fi
+    done
+}
+
+print_worktrees() {
+    [[ ${#WORKTREE_BRANCHES[@]} -eq 0 ]] && return
+
+    echo -e "\n${C_CYAN}${C_BOLD}WORKTREES${C_RESET}"
+    for branch in "${WORKTREE_BRANCHES[@]}"; do
+        printf "  %-${COL_WIDTH}s" "$branch"
+
+        local tag="${WT_CLASS[$branch]}"
+        if [[ "${WT_DELETABLE[$branch]}" == "yes" ]]; then
+            tag="${tag}, deletable"
+        fi
+
+        local extra=""
+        if [[ -n "${WT_DIRTY[$branch]}" ]]; then
+            extra=" ${C_RED}${WT_DIRTY[$branch]}${C_RESET}"
+        fi
+
+        echo -e "  [${tag}]${extra}  ${C_DIM}${WORKTREE_BRANCH_PATH[$branch]}${C_RESET}"
+    done
+}
+
+output_human() {
+    COL_WIDTH=$MAX_BRANCH_WIDTH
+    local total=$(( ${#BRANCHES_stale_merged[@]} + ${#BRANCHES_stale_closed[@]} + ${#BRANCHES_active[@]} + ${#BRANCHES_orphan[@]} + ${#BRANCHES_unpushed[@]} ))
+    echo -e "${C_BOLD}branch-cleanup${C_RESET} - ${total} local branches (on ${MAIN_BRANCH})"
+
+    print_section "STALE (merged)" "$C_GREEN" BRANCH_DETAIL "${BRANCHES_stale_merged[@]+"${BRANCHES_stale_merged[@]}"}"
+    print_section "STALE (closed)" "$C_GREEN" BRANCH_DETAIL "${BRANCHES_stale_closed[@]+"${BRANCHES_stale_closed[@]}"}"
+    print_section "ACTIVE" "$C_CYAN" BRANCH_DETAIL "${BRANCHES_active[@]+"${BRANCHES_active[@]}"}"
+    print_section "ORPHAN" "$C_YELLOW" BRANCH_DETAIL "${BRANCHES_orphan[@]+"${BRANCHES_orphan[@]}"}"
+    print_section "UNPUSHED WORK" "$C_RED" BRANCH_DETAIL "${BRANCHES_unpushed[@]+"${BRANCHES_unpushed[@]}"}"
+
+    if $OPT_WORKTREES; then
+        print_worktrees
+    fi
+
+    if $OPT_REMOTE; then
+        print_section "STALE (merged) (remote)" "$C_GREEN" REMOTE_DETAIL "${REMOTE_stale_merged[@]+"${REMOTE_stale_merged[@]}"}"
+        print_section "STALE (closed) (remote)" "$C_GREEN" REMOTE_DETAIL "${REMOTE_stale_closed[@]+"${REMOTE_stale_closed[@]}"}"
+        print_section "ACTIVE (remote)" "$C_CYAN" REMOTE_DETAIL "${REMOTE_active[@]+"${REMOTE_active[@]}"}"
+        print_section "ORPHAN (remote)" "$C_YELLOW" REMOTE_DETAIL "${REMOTE_orphan[@]+"${REMOTE_orphan[@]}"}"
+    fi
+
+    if ! $OPT_DELETE; then
+        local deletable=$(( ${#BRANCHES_stale_merged[@]} + ${#BRANCHES_stale_closed[@]} + ${#BRANCHES_orphan[@]} ))
+        if [[ $deletable -gt 0 ]]; then
+            echo -e "\n${C_DIM}${deletable} branches could be deleted. Run with --delete to clean up.${C_RESET}"
+        fi
+    fi
+}
+
+# --- Deletion ---
+confirm_delete() {
+    local item="$1" detail="$2"
+    if $OPT_YES; then
+        return 0
+    fi
+    echo -n "Delete ${item}? (${detail}) [y/N] "
+    read -r answer
+    [[ "$answer" =~ ^[Yy]$ ]]
+}
+
+do_delete() {
+    local deleted=0
+
+    # Delete stale local branches (PR is merged/closed, safe to force-delete)
+    for branch in \
+        "${BRANCHES_stale_merged[@]+"${BRANCHES_stale_merged[@]}"}" \
+        "${BRANCHES_stale_closed[@]+"${BRANCHES_stale_closed[@]}"}"; do
+        [[ -z "$branch" ]] && continue
+        if confirm_delete "$branch" "${BRANCH_DETAIL[$branch]}"; then
+            if git branch -D "$branch" 2>/dev/null; then
+                deleted=$((deleted + 1))
+            fi
+        fi
+    done
+
+    # Delete orphan local branches (no PR found, use -d to protect unmerged work)
+    for branch in "${BRANCHES_orphan[@]+"${BRANCHES_orphan[@]}"}"; do
+        [[ -z "$branch" ]] && continue
+        if confirm_delete "$branch" "${BRANCH_DETAIL[$branch]}"; then
+            if ! git branch -d "$branch" 2>/dev/null; then
+                echo "Skipped ${branch}: has unmerged changes (use git branch -D to force)" >&2
+            else
+                deleted=$((deleted + 1))
+            fi
+        fi
+    done
+
+    # Delete deletable worktrees (clean + stale/orphan)
+    if $OPT_WORKTREES; then
+        for branch in "${WORKTREE_BRANCHES[@]+"${WORKTREE_BRANCHES[@]}"}"; do
+            [[ "${WT_DELETABLE[$branch]}" != "yes" ]] && continue
+            local path="${WORKTREE_BRANCH_PATH[$branch]}"
+            if confirm_delete "worktree ${branch} at ${path}" "${WT_CLASS[$branch]}"; then
+                if git worktree remove "$path" 2>/dev/null; then
+                    git branch -D "$branch" 2>/dev/null || true
+                    deleted=$((deleted + 1))
+                fi
+            fi
+        done
+    fi
+
+    # Delete stale remote branches
+    if $OPT_REMOTE; then
+        for ref in \
+            "${REMOTE_stale_merged[@]+"${REMOTE_stale_merged[@]}"}" \
+            "${REMOTE_stale_closed[@]+"${REMOTE_stale_closed[@]}"}"; do
+            [[ -z "$ref" ]] && continue
+            local remote_branch="${ref#origin/}"
+            if confirm_delete "remote ${ref}" "${REMOTE_DETAIL[$ref]}"; then
+                if git push origin --delete "$remote_branch" 2>/dev/null; then
+                    deleted=$((deleted + 1))
+                fi
+            fi
+        done
+    fi
+
+    echo "${deleted} items deleted."
+}
+
+# --- Main ---
+if $OPT_JSON; then
+    output_json
+else
+    output_human
+    if $OPT_DELETE; then
+        do_delete
+    fi
+fi
