@@ -101,5 +101,6 @@
   "tui": "fullscreen",
   "showThinkingSummaries": true,
   "theme": "light",
-  "skipAutoPermissionPrompt": true
+  "skipAutoPermissionPrompt": true,
+  "advisorModel": "opus"
 }
