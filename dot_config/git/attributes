@@ -1,0 +1,15 @@
+*.java     diff=java
+*.kt       diff=java
+*.ts       diff=typescript
+*.tsx      diff=typescript
+*.js       diff=javascript
+*.jsx      diff=javascript
+*.py       diff=python
+*.go       diff=golang
+*.rs       diff=rust
+*.css      diff=css
+*.html     diff=html
+*.md       diff=markdown
+*.php      diff=php
+*.rb       diff=ruby
+*.sh       diff=bash

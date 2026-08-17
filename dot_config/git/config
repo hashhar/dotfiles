@@ -13,6 +13,13 @@
 	safecrlf = warn
 	autocrlf = input
 	editor = nvim
+	pager = delta
+[delta]
+	navigate = true
+	line-numbers = true
+	hyperlinks = true
+[interactive]
+	diffFilter = delta --color-only
 [commit]
 	template = ~/.config/git/commit-template
 	verbose = true
