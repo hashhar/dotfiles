@@ -14,6 +14,9 @@
 	autocrlf = input
 	editor = nvim
 	pager = delta
+	# Speeds up status/diff in large repos. Revert these two first if status misbehaves.
+	fsmonitor = true
+	untrackedCache = true
 [delta]
 	navigate = true
 	line-numbers = true
@@ -96,3 +99,11 @@
 	program = gpg
 [log]
 	follow = true
+[branch]
+	sort = -committerdate
+[tag]
+	sort = version:refname
+[column]
+	ui = auto
+[init]
+	defaultBranch = main
