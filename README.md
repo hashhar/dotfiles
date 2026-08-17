@@ -24,6 +24,7 @@ My dotfiles, managed with [chezmoi](https://chezmoi.io).
 | `dot_local/bin/` | Personal scripts (branch cleanup, PR comments, transcript extraction, Claude theme sync) |
 | `dot_zshrc` | zsh config: Claude wrapper, tool init (sdkman/jenv/gcloud/fzf/liquidprompt) |
 | `dot_config/tmux/` | tmux config (plugins via TPM) |
+| `dot_config/ghostty/` | Ghostty terminal config |
 
 ## License
 

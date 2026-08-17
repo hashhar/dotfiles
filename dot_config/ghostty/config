@@ -1,0 +1,4 @@
+font-family=Fira Mono
+font-size=15
+theme=Gruvbox Dark Hard
+keybind = shift+enter=text:\x1b\r
