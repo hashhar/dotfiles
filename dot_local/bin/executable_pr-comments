@@ -12,6 +12,7 @@ import re
 import subprocess
 import sys
 from datetime import date, datetime
+from fnmatch import fnmatch
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -100,6 +101,7 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
       reviewThreads(first: 100, after: $cursor) {
         pageInfo { hasNextPage endCursor }
         nodes {
+          id
           isResolved
           isOutdated
           path
@@ -108,9 +110,13 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
           diffSide
           comments(first: 100) {
             nodes {
-              author { login }
+              id
+              databaseId
+              url
+              author { login __typename }
               body
               createdAt
+              diffHunk
             }
           }
         }
@@ -119,6 +125,38 @@ query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
   }
 }
 """
+
+# GitHub splits a review into two parts. The review carries the state and the
+# summary body; the inline notes hang off reviewThreads. Fetch both, or a
+# reviewer who writes "looks good, two nits below" leaves no visible trace.
+REVIEWS_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviews(first: 50, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id
+          author { login __typename }
+          state
+          body
+          createdAt
+          url
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def actor_is_bot(actor: dict | None) -> bool:
+    """Report whether a GraphQL actor is a bot.
+
+    GraphQL types the actor, so trust `__typename`. The login is not a reliable
+    signal; `copilot-pull-request-reviewer` carries no `[bot]` suffix.
+    """
+    return (actor or {}).get("__typename") == "Bot"
 
 
 def fetch_review_threads(owner: str, repo: str, number: int) -> tuple[dict, list[dict]]:
@@ -145,17 +183,27 @@ def fetch_review_threads(owner: str, repo: str, number: int) -> tuple[dict, list
 
         rt = pr.get("reviewThreads", {})
         for node in rt.get("nodes", []):
+            comment_nodes = node.get("comments", {}).get("nodes", [])
             comments = []
-            for c in node.get("comments", {}).get("nodes", []):
+            for c in comment_nodes:
                 comments.append({
+                    "id": c.get("id", ""),
+                    "database_id": c.get("databaseId"),
+                    "url": c.get("url", ""),
                     "author": (c.get("author") or {}).get("login", "unknown"),
+                    "is_bot": actor_is_bot(c.get("author")),
                     "body": c.get("body", ""),
                     "created_at": c.get("createdAt", ""),
                 })
             threads.append({
+                "id": node.get("id", ""),
                 "file": node.get("path", ""),
                 "line": node.get("line"),
                 "start_line": node.get("startLine"),
+                "diff_side": node.get("diffSide", ""),
+                # Every comment on a thread repeats the same anchor hunk.
+                # Keep one copy.
+                "diff_hunk": comment_nodes[0].get("diffHunk", "") if comment_nodes else "",
                 "is_resolved": node.get("isResolved", False),
                 "is_outdated": node.get("isOutdated", False),
                 "comments": comments,
@@ -170,33 +218,69 @@ def fetch_review_threads(owner: str, repo: str, number: int) -> tuple[dict, list
     return pr_info, threads
 
 
+def fetch_reviews(owner: str, repo: str, number: int) -> list[dict]:
+    """Fetch every review on the PR, with its state and summary body."""
+    reviews = []
+    cursor = None
+
+    while True:
+        variables: dict[str, Any] = {"owner": owner, "repo": repo, "number": number}
+        if cursor:
+            variables["cursor"] = cursor
+
+        data = graphql(REVIEWS_QUERY, **variables)
+        node = data.get("repository", {}).get("pullRequest", {}).get("reviews", {})
+
+        for r in node.get("nodes", []):
+            reviews.append({
+                "id": r.get("id", ""),
+                "url": r.get("url", ""),
+                "author": (r.get("author") or {}).get("login", "unknown"),
+                "is_bot": actor_is_bot(r.get("author")),
+                "state": r.get("state", ""),
+                "body": r.get("body", ""),
+                "created_at": r.get("createdAt", ""),
+            })
+
+        page_info = node.get("pageInfo", {})
+        if page_info.get("hasNextPage"):
+            cursor = page_info.get("endCursor")
+        else:
+            break
+
+    return reviews
+
+
 def fetch_issue_comments(owner: str, repo: str, number: int) -> list[dict]:
     """Fetch top-level PR comments (issue comments)."""
+    # --slurp collects the pages into one JSON array of arrays. It cannot be
+    # combined with -q. Parsing the whole payload at once beats reading it line
+    # by line; gh is free to reformat its output, and a line-wise reader turns
+    # that into a silent empty result.
     raw = run_gh("api", f"repos/{owner}/{repo}/issues/{number}/comments",
-                 "--paginate", "-q", ".")
-    # gh --paginate with -q "." outputs one JSON array per page
-    # We need to handle both single array and concatenated arrays
+                 "--paginate", "--slurp")
+    if not raw.strip():
+        return []
+
+    try:
+        pages = json.loads(raw)
+    except json.JSONDecodeError as e:
+        print(f"Error: cannot parse issue comments from gh: {e}", file=sys.stderr)
+        sys.exit(1)
+
     comments = []
-    for line in raw.strip().split("\n"):
-        if not line.strip():
-            continue
-        try:
-            parsed = json.loads(line)
-            if isinstance(parsed, list):
-                for c in parsed:
-                    comments.append({
-                        "author": (c.get("user") or {}).get("login", "unknown"),
-                        "body": c.get("body", ""),
-                        "created_at": c.get("created_at", ""),
-                    })
-            elif isinstance(parsed, dict):
-                comments.append({
-                    "author": (parsed.get("user") or {}).get("login", "unknown"),
-                    "body": parsed.get("body", ""),
-                    "created_at": parsed.get("created_at", ""),
-                })
-        except json.JSONDecodeError:
-            continue
+    for page in pages:
+        for c in page:
+            user = c.get("user") or {}
+            comments.append({
+                "id": c.get("node_id", ""),
+                "database_id": c.get("id"),
+                "url": c.get("html_url", ""),
+                "author": user.get("login", "unknown"),
+                "is_bot": user.get("type") == "Bot",
+                "body": c.get("body", ""),
+                "created_at": c.get("created_at", ""),
+            })
 
     return comments
 
@@ -210,15 +294,57 @@ def parse_datetime(s: str) -> datetime:
     return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+GLOB_CHARS = set("*?[")
+
+
+def path_matches(path: str, patterns: list[str]) -> bool:
+    """Test a file path against the --path patterns.
+
+    A pattern holding glob characters matches as a glob. A plain pattern
+    matches as a directory or filename prefix, so `--path src/api` picks up
+    everything beneath it.
+    """
+    if not patterns:
+        return True
+    for pattern in patterns:
+        if GLOB_CHARS & set(pattern):
+            if fnmatch(path, pattern):
+                return True
+        elif path == pattern or path.startswith(pattern.rstrip("/") + "/"):
+            return True
+    return False
+
+
+def latest_date(items: list[dict]) -> date | None:
+    """Return the newest parseable creation date, or None if there is none."""
+    dates = []
+    for item in items:
+        try:
+            dates.append(parse_datetime(item["created_at"]).date())
+        except (ValueError, TypeError):
+            pass
+    return max(dates) if dates else None
+
+
 def filter_threads(
     threads: list[dict],
     unresolved_only: bool = False,
     by_user: str | None = None,
     since_date: date | None = None,
+    no_bots: bool = False,
+    paths: list[str] | None = None,
 ) -> list[dict]:
     filtered = []
     for thread in threads:
         if unresolved_only and thread["is_resolved"]:
+            continue
+
+        if not path_matches(thread["file"], paths or []):
+            continue
+
+        # Drop a thread only when every comment on it comes from a bot. A human
+        # replying to a bot makes the whole exchange worth reading.
+        if no_bots and all(c["is_bot"] for c in thread["comments"]):
             continue
 
         if by_user:
@@ -227,26 +353,25 @@ def filter_threads(
                 continue
 
         if since_date:
-            dates = []
-            for c in thread["comments"]:
-                try:
-                    dates.append(parse_datetime(c["created_at"]).date())
-                except (ValueError, TypeError):
-                    pass
-            if dates and max(dates) < since_date:
+            newest = latest_date(thread["comments"])
+            if newest and newest < since_date:
                 continue
 
         filtered.append(thread)
     return filtered
 
 
-def filter_issue_comments(
+def filter_comment_list(
     comments: list[dict],
     by_user: str | None = None,
     since_date: date | None = None,
+    no_bots: bool = False,
 ) -> list[dict]:
+    """Filter a flat list of authored items: issue comments or reviews."""
     filtered = []
     for c in comments:
+        if no_bots and c["is_bot"]:
+            continue
         if by_user and c["author"].lower() != by_user.lower():
             continue
         if since_date:
@@ -257,6 +382,20 @@ def filter_issue_comments(
                 pass
         filtered.append(c)
     return filtered
+
+
+def drop_empty_reviews(reviews: list[dict]) -> list[dict]:
+    """Discard reviews that carry no information.
+
+    Submitting inline notes creates a COMMENTED review with an empty body. That
+    review is a container for comments the thread listing already shows. An
+    approval or a change request still matters with an empty body; its state is
+    the message.
+    """
+    return [
+        r for r in reviews
+        if r["body"].strip() or r["state"] != "COMMENTED"
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -271,14 +410,60 @@ def format_date(iso_str: str) -> str:
         return iso_str[:10] if len(iso_str) >= 10 else iso_str
 
 
+STATE_LABELS = {
+    "APPROVED": "approved",
+    "CHANGES_REQUESTED": "changes requested",
+    "COMMENTED": "commented",
+    "DISMISSED": "dismissed",
+    "PENDING": "pending",
+}
+
+DIFF_HUNK_LINES = 6
+
+
+def render_hunk(hunk: str) -> list[str]:
+    """Render the tail of a diff hunk as a fenced block.
+
+    The hunk ends at the line the comment anchors to. The tail is the part that
+    gives the comment its context.
+    """
+    hunk_lines = [ln for ln in hunk.split("\n") if ln]
+    if not hunk_lines:
+        return []
+    tail = hunk_lines[-DIFF_HUNK_LINES:]
+    prefix = ["```diff"]
+    if len(hunk_lines) > DIFF_HUNK_LINES:
+        prefix.append(f"@@ ... {len(hunk_lines) - DIFF_HUNK_LINES} earlier lines omitted")
+    return prefix + tail + ["```", ""]
+
+
 def render_human(
     pr_info: dict,
     threads: list[dict],
     issue_comments: list[dict],
+    reviews: list[dict],
+    show_diff: bool = False,
 ) -> str:
     lines = []
     lines.append(f"# PR #{pr_info['number']}: {pr_info['title']} - @{pr_info['author']}")
     lines.append("")
+
+    # Reviews carry the verdict and the summary body. Lead with them.
+    if reviews:
+        lines.append("## Reviews")
+        lines.append("")
+        for r in reviews:
+            state = STATE_LABELS.get(r["state"], r["state"].lower())
+            lines.append(
+                f"**@{r['author']}** [{state}] ({format_date(r['created_at'])}):"
+            )
+            body = r["body"].strip()
+            if body:
+                for body_line in body.split("\n"):
+                    lines.append(f"> {body_line}")
+            else:
+                lines.append("> (no summary body)")
+            lines.append("")
 
     # Top-level comments
     if issue_comments:
@@ -309,7 +494,8 @@ def render_human(
             elif end:
                 loc = f"L{end}"
             else:
-                loc = ""
+                # An outdated thread loses its line once the diff moves past it.
+                loc = "(line gone)"
 
             # Status
             status_parts = []
@@ -323,6 +509,9 @@ def render_human(
 
             lines.append(f"### {loc} [{status}]")
             lines.append("")
+
+            if show_diff and thread.get("diff_hunk"):
+                lines.extend(render_hunk(thread["diff_hunk"]))
 
             for i, c in enumerate(thread["comments"]):
                 prefix = "  " if i > 0 else ""
@@ -345,9 +534,11 @@ def render_json(
     pr_info: dict,
     threads: list[dict],
     issue_comments: list[dict],
+    reviews: list[dict],
 ) -> str:
     return json.dumps({
         "pr": pr_info,
+        "reviews": reviews,
         "issue_comments": issue_comments,
         "review_threads": threads,
     }, indent=2, default=str)
@@ -368,6 +559,8 @@ Examples:
   pr-comments https://github.com/owner/repo/pull/123 --unresolved
   pr-comments https://github.com/owner/repo/pull/123 --by reviewer-name
   pr-comments https://github.com/owner/repo/pull/123 --since 2026-04-01
+  pr-comments https://github.com/owner/repo/pull/123 --no-bots --unresolved
+  pr-comments https://github.com/owner/repo/pull/123 --path src/api --diff
 """,
     )
     parser.add_argument("pr", help="PR URL or number")
@@ -378,6 +571,14 @@ Examples:
                         help="Filter to comments by a specific user")
     parser.add_argument("--since", metavar="DATE",
                         help="Only show comments after date (YYYY-MM-DD)")
+    parser.add_argument("--path", metavar="PATTERN", action="append",
+                        help="Only show threads on matching paths. Repeatable. "
+                             "A plain value matches as a directory prefix; "
+                             "a value with * ? [ matches as a glob.")
+    parser.add_argument("--no-bots", action="store_true",
+                        help="Hide reviews and comments authored by bots")
+    parser.add_argument("--diff", action="store_true",
+                        help="Show the diff hunk each thread anchors to")
     parser.add_argument("--json", action="store_true",
                         help="Output as JSON")
 
@@ -390,20 +591,25 @@ Examples:
 
     pr_info, threads = fetch_review_threads(owner, repo, number)
     issue_comments = fetch_issue_comments(owner, repo, number)
+    reviews = fetch_reviews(owner, repo, number)
 
     # Apply filters
-    threads = filter_threads(threads, args.unresolved, args.by, since_date)
-    issue_comments = filter_issue_comments(issue_comments, args.by, since_date)
+    threads = filter_threads(threads, args.unresolved, args.by, since_date,
+                             args.no_bots, args.path)
+    issue_comments = filter_comment_list(issue_comments, args.by, since_date,
+                                         args.no_bots)
+    reviews = filter_comment_list(drop_empty_reviews(reviews), args.by,
+                                  since_date, args.no_bots)
 
-    total = len(threads) + len(issue_comments)
     unresolved = sum(1 for t in threads if not t["is_resolved"])
-    print(f"Found {len(threads)} review threads ({unresolved} unresolved), "
+    print(f"Found {len(reviews)} reviews, "
+          f"{len(threads)} review threads ({unresolved} unresolved), "
           f"{len(issue_comments)} top-level comments.", file=sys.stderr)
 
     if args.json:
-        print(render_json(pr_info, threads, issue_comments))
+        print(render_json(pr_info, threads, issue_comments, reviews))
     else:
-        print(render_human(pr_info, threads, issue_comments))
+        print(render_human(pr_info, threads, issue_comments, reviews, args.diff))
 
 
 if __name__ == "__main__":
