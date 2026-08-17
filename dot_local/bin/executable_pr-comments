@@ -1,0 +1,410 @@
+#!/usr/bin/env python3
+"""Fetch and display all review activity on a GitHub pull request.
+
+Uses the gh CLI for GitHub API access (both GraphQL and REST).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import subprocess
+import sys
+from datetime import date, datetime
+from typing import Any
+
+# ---------------------------------------------------------------------------
+# GitHub API helpers
+# ---------------------------------------------------------------------------
+
+def run_gh(*args: str) -> str:
+    """Run a gh CLI command and return stdout."""
+    try:
+        result = subprocess.run(
+            ["gh", *args],
+            capture_output=True, text=True, check=True,
+        )
+        return result.stdout
+    except FileNotFoundError:
+        print("Error: gh (GitHub CLI) is not installed.", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.CalledProcessError as e:
+        print(f"Error running gh {' '.join(args[:3])}...: {e.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+
+def graphql(query: str, **variables: Any) -> dict:
+    """Execute a GraphQL query via gh api graphql."""
+    cmd = ["api", "graphql", "-f", f"query={query}"]
+    for k, v in variables.items():
+        if isinstance(v, int):
+            cmd.extend(["-F", f"{k}={v}"])
+        else:
+            cmd.extend(["-f", f"{k}={v}"])
+    raw = run_gh(*cmd)
+    data = json.loads(raw)
+    if "errors" in data:
+        print(f"GraphQL errors: {data['errors']}", file=sys.stderr)
+        sys.exit(1)
+    return data.get("data", {})
+
+
+# ---------------------------------------------------------------------------
+# URL parsing
+# ---------------------------------------------------------------------------
+
+PR_URL_RE = re.compile(
+    r"https?://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)"
+)
+
+
+def parse_pr_ref(pr_ref: str, repo_flag: str | None) -> tuple[str, str, int]:
+    """Parse a PR reference into (owner, repo, number)."""
+    m = PR_URL_RE.match(pr_ref)
+    if m:
+        return m.group("owner"), m.group("repo"), int(m.group("number"))
+
+    # Try as a plain number with --repo
+    try:
+        number = int(pr_ref)
+    except ValueError:
+        print(f"Error: cannot parse PR reference '{pr_ref}'", file=sys.stderr)
+        print("Use a URL like https://github.com/owner/repo/pull/123", file=sys.stderr)
+        print("Or a number with --repo owner/repo", file=sys.stderr)
+        sys.exit(1)
+
+    if not repo_flag:
+        print("Error: --repo is required when using a PR number", file=sys.stderr)
+        sys.exit(1)
+
+    parts = repo_flag.split("/")
+    if len(parts) != 2:
+        print(f"Error: --repo should be owner/repo, got '{repo_flag}'", file=sys.stderr)
+        sys.exit(1)
+
+    return parts[0], parts[1], number
+
+
+# ---------------------------------------------------------------------------
+# Data fetching
+# ---------------------------------------------------------------------------
+
+REVIEW_THREADS_QUERY = """
+query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      title
+      url
+      author { login }
+      reviewThreads(first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          isResolved
+          isOutdated
+          path
+          line
+          startLine
+          diffSide
+          comments(first: 100) {
+            nodes {
+              author { login }
+              body
+              createdAt
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"""
+
+
+def fetch_review_threads(owner: str, repo: str, number: int) -> tuple[dict, list[dict]]:
+    """Fetch PR metadata and all review threads. Returns (pr_info, threads)."""
+    threads = []
+    cursor = None
+    pr_info = {}
+
+    while True:
+        variables: dict[str, Any] = {"owner": owner, "repo": repo, "number": number}
+        if cursor:
+            variables["cursor"] = cursor
+
+        data = graphql(REVIEW_THREADS_QUERY, **variables)
+        pr = data.get("repository", {}).get("pullRequest", {})
+
+        if not pr_info:
+            pr_info = {
+                "number": number,
+                "title": pr.get("title", ""),
+                "url": pr.get("url", ""),
+                "author": (pr.get("author") or {}).get("login", "unknown"),
+            }
+
+        rt = pr.get("reviewThreads", {})
+        for node in rt.get("nodes", []):
+            comments = []
+            for c in node.get("comments", {}).get("nodes", []):
+                comments.append({
+                    "author": (c.get("author") or {}).get("login", "unknown"),
+                    "body": c.get("body", ""),
+                    "created_at": c.get("createdAt", ""),
+                })
+            threads.append({
+                "file": node.get("path", ""),
+                "line": node.get("line"),
+                "start_line": node.get("startLine"),
+                "is_resolved": node.get("isResolved", False),
+                "is_outdated": node.get("isOutdated", False),
+                "comments": comments,
+            })
+
+        page_info = rt.get("pageInfo", {})
+        if page_info.get("hasNextPage"):
+            cursor = page_info.get("endCursor")
+        else:
+            break
+
+    return pr_info, threads
+
+
+def fetch_issue_comments(owner: str, repo: str, number: int) -> list[dict]:
+    """Fetch top-level PR comments (issue comments)."""
+    raw = run_gh("api", f"repos/{owner}/{repo}/issues/{number}/comments",
+                 "--paginate", "-q", ".")
+    # gh --paginate with -q "." outputs one JSON array per page
+    # We need to handle both single array and concatenated arrays
+    comments = []
+    for line in raw.strip().split("\n"):
+        if not line.strip():
+            continue
+        try:
+            parsed = json.loads(line)
+            if isinstance(parsed, list):
+                for c in parsed:
+                    comments.append({
+                        "author": (c.get("user") or {}).get("login", "unknown"),
+                        "body": c.get("body", ""),
+                        "created_at": c.get("created_at", ""),
+                    })
+            elif isinstance(parsed, dict):
+                comments.append({
+                    "author": (parsed.get("user") or {}).get("login", "unknown"),
+                    "body": parsed.get("body", ""),
+                    "created_at": parsed.get("created_at", ""),
+                })
+        except json.JSONDecodeError:
+            continue
+
+    return comments
+
+
+# ---------------------------------------------------------------------------
+# Filtering
+# ---------------------------------------------------------------------------
+
+def parse_datetime(s: str) -> datetime:
+    """Parse ISO datetime string."""
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
+
+def filter_threads(
+    threads: list[dict],
+    unresolved_only: bool = False,
+    by_user: str | None = None,
+    since_date: date | None = None,
+) -> list[dict]:
+    filtered = []
+    for thread in threads:
+        if unresolved_only and thread["is_resolved"]:
+            continue
+
+        if by_user:
+            authors = {c["author"].lower() for c in thread["comments"]}
+            if by_user.lower() not in authors:
+                continue
+
+        if since_date:
+            dates = []
+            for c in thread["comments"]:
+                try:
+                    dates.append(parse_datetime(c["created_at"]).date())
+                except (ValueError, TypeError):
+                    pass
+            if dates and max(dates) < since_date:
+                continue
+
+        filtered.append(thread)
+    return filtered
+
+
+def filter_issue_comments(
+    comments: list[dict],
+    by_user: str | None = None,
+    since_date: date | None = None,
+) -> list[dict]:
+    filtered = []
+    for c in comments:
+        if by_user and c["author"].lower() != by_user.lower():
+            continue
+        if since_date:
+            try:
+                if parse_datetime(c["created_at"]).date() < since_date:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        filtered.append(c)
+    return filtered
+
+
+# ---------------------------------------------------------------------------
+# Output: human-readable
+# ---------------------------------------------------------------------------
+
+def format_date(iso_str: str) -> str:
+    try:
+        dt = parse_datetime(iso_str)
+        return dt.strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return iso_str[:10] if len(iso_str) >= 10 else iso_str
+
+
+def render_human(
+    pr_info: dict,
+    threads: list[dict],
+    issue_comments: list[dict],
+) -> str:
+    lines = []
+    lines.append(f"# PR #{pr_info['number']}: {pr_info['title']} - @{pr_info['author']}")
+    lines.append("")
+
+    # Top-level comments
+    if issue_comments:
+        lines.append("## Top-level comments")
+        lines.append("")
+        for c in issue_comments:
+            lines.append(f"**@{c['author']}** ({format_date(c['created_at'])}):")
+            for body_line in c["body"].split("\n"):
+                lines.append(f"> {body_line}")
+            lines.append("")
+
+    # Group threads by file
+    threads_by_file: dict[str, list[dict]] = {}
+    for t in threads:
+        f = t["file"] or "(no file)"
+        threads_by_file.setdefault(f, []).append(t)
+
+    for filepath, file_threads in sorted(threads_by_file.items()):
+        lines.append(f"## {filepath}")
+        lines.append("")
+
+        for thread in file_threads:
+            # Line range
+            start = thread.get("start_line")
+            end = thread.get("line")
+            if start and end and start != end:
+                loc = f"L{start}-L{end}"
+            elif end:
+                loc = f"L{end}"
+            else:
+                loc = ""
+
+            # Status
+            status_parts = []
+            if thread["is_resolved"]:
+                status_parts.append("resolved")
+            else:
+                status_parts.append("unresolved")
+            if thread["is_outdated"]:
+                status_parts.append("outdated")
+            status = ", ".join(status_parts)
+
+            lines.append(f"### {loc} [{status}]")
+            lines.append("")
+
+            for i, c in enumerate(thread["comments"]):
+                prefix = "  " if i > 0 else ""
+                lines.append(f"{prefix}**@{c['author']}** ({format_date(c['created_at'])}):")
+                for body_line in c["body"].split("\n"):
+                    lines.append(f"{prefix}> {body_line}")
+                lines.append("")
+
+        lines.append("---")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Output: JSON
+# ---------------------------------------------------------------------------
+
+def render_json(
+    pr_info: dict,
+    threads: list[dict],
+    issue_comments: list[dict],
+) -> str:
+    return json.dumps({
+        "pr": pr_info,
+        "issue_comments": issue_comments,
+        "review_threads": threads,
+    }, indent=2, default=str)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Fetch and display all review activity on a GitHub PR.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  pr-comments https://github.com/owner/repo/pull/123
+  pr-comments 123 --repo owner/repo
+  pr-comments https://github.com/owner/repo/pull/123 --unresolved
+  pr-comments https://github.com/owner/repo/pull/123 --by reviewer-name
+  pr-comments https://github.com/owner/repo/pull/123 --since 2026-04-01
+""",
+    )
+    parser.add_argument("pr", help="PR URL or number")
+    parser.add_argument("--repo", help="owner/repo (required when using PR number)")
+    parser.add_argument("--unresolved", action="store_true",
+                        help="Show only unresolved threads")
+    parser.add_argument("--by", metavar="USERNAME",
+                        help="Filter to comments by a specific user")
+    parser.add_argument("--since", metavar="DATE",
+                        help="Only show comments after date (YYYY-MM-DD)")
+    parser.add_argument("--json", action="store_true",
+                        help="Output as JSON")
+
+    args = parser.parse_args()
+
+    owner, repo, number = parse_pr_ref(args.pr, args.repo)
+    since_date = date.fromisoformat(args.since) if args.since else None
+
+    print(f"Fetching PR #{number} from {owner}/{repo}...", file=sys.stderr)
+
+    pr_info, threads = fetch_review_threads(owner, repo, number)
+    issue_comments = fetch_issue_comments(owner, repo, number)
+
+    # Apply filters
+    threads = filter_threads(threads, args.unresolved, args.by, since_date)
+    issue_comments = filter_issue_comments(issue_comments, args.by, since_date)
+
+    total = len(threads) + len(issue_comments)
+    unresolved = sum(1 for t in threads if not t["is_resolved"])
+    print(f"Found {len(threads)} review threads ({unresolved} unresolved), "
+          f"{len(issue_comments)} top-level comments.", file=sys.stderr)
+
+    if args.json:
+        print(render_json(pr_info, threads, issue_comments))
+    else:
+        print(render_human(pr_info, threads, issue_comments))
+
+
+if __name__ == "__main__":
+    main()
