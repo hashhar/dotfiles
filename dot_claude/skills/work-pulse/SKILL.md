@@ -165,12 +165,26 @@ A todo appearing across multiple consecutive daily notes is a **chronic rollover
 For every item found, note:
 - **Source**: `github-pr`, `github-issue`, `jira`, `slack`, `gdocs`, `branch`, `obsidian`
 - **Title**: short description
-- **Link/ref**: URL or path
+- **Link**: a clickable URL (see link formats below) - **every item in the report MUST have a link**
 - **Last touched**: date of last activity
 - **Staleness**: active <=7d, coasting 7-30d, stale >30d
 - **Stakeholder signal**: from/involving Manager or PM?
 - **Deadline**: explicit due date or milestone?
 - **Waiting on you**: is something blocked on your action?
+
+### Link formats by source
+
+Use markdown link syntax `[text](url)` as it renders as clickable in the terminal.
+
+| Source | Link format |
+|--------|-------------|
+| GitHub PR | `[org/repo#N](https://github.com/org/repo/pull/N)` |
+| GitHub Issue | `[org/repo#N](https://github.com/org/repo/issues/N)` |
+| Jira | `[KEY-123](https://SITE/browse/KEY-123)` using the Jira site from `context.md` |
+| Slack message | Use the permalink URL returned by search: `[Slack: #channel](permalink)` or `[Slack DM: Person](permalink)` |
+| Google Docs | Extract the doc URL from the Gmail snippet/subject: `[Doc title](url)` |
+| Branch | `[repo - branch](https://github.com/org/repo/tree/branch)` - construct from the org in `context.md` and the repo basename. For branches with a known PR, link to the PR instead. |
+| Obsidian | `[filename](file:///path/to/file.md)` |
 
 ## Step 3: Apply the Eisenhower matrix
 
@@ -217,42 +231,53 @@ For every item found, note:
 
 Use this structure. Keep each item to 1-2 lines - enough to act, not a wall of text.
 
-```
-===============================================================
-  WORK PULSE  -  <today's date>
-===============================================================
+**Every item MUST include a clickable markdown link.** Use `[text](url)` syntax as it renders as clickable in the terminal. No item should appear as bare text without a link.
+
+**CRITICAL: Output the entire report as normal markdown prose - NOT inside a fenced code block.** Code blocks prevent link rendering. Use `---` horizontal rules and `**bold**` for section headers instead.
+
+Structure:
+
+---
+**WORK PULSE - <today's date>**
 
 SOURCES: GitHub PRs / Jira / Slack / Google Docs / Branches / Obsidian
 (note any that failed)
 
----------------------------------------------------------------
-Q1 - URGENT + IMPORTANT  ->  Do today
----------------------------------------------------------------
-[TAG]  Title
-       URL or path  |  why it's here
+---
+**Q1 - URGENT + IMPORTANT -> Do today**
 
----------------------------------------------------------------
-Q2 - NOT URGENT + IMPORTANT  ->  Schedule this week
----------------------------------------------------------------
+[TAG] Title - [link text](url)
+why it's here
 
----------------------------------------------------------------
-Q3 - URGENT + NOT IMPORTANT  ->  Batch / quick-win
----------------------------------------------------------------
+Example entries:
 
----------------------------------------------------------------
-Q4 - NOT URGENT + NOT IMPORTANT  ->  Decide: delete or commit?
----------------------------------------------------------------
+[JIRA] [ENG-7400](https://site.atlassian.net/browse/ENG-7400) (P0) - Add Business Context metadata
+In Progress | from Monica (PM) | only P0 in queue
 
----------------------------------------------------------------
-SUMMARY
----------------------------------------------------------------
+[PR] [org/repo#123](https://github.com/org/repo/pull/123) - Fix double-execution
+APPROVED by 2 reviewers, merge today
+
+[SLACK] [Mateusz Gajewski DM](https://slack.com/archives/...) - "ptal: trino-python-client#597"
+5 days unreplied, they're waiting
+
+---
+**Q2 - NOT URGENT + IMPORTANT -> Schedule this week**
+
+---
+**Q3 - URGENT + NOT IMPORTANT -> Batch / quick-win**
+
+---
+**Q4 - NOT URGENT + NOT IMPORTANT -> Decide: delete or commit?**
+
+---
+**SUMMARY**
+
 GitHub PRs (authored): N | Reviews requested: N
 Jira: N | Slack saves: N | Slack unreplied DMs: N | Google Docs: N
 Branches active: N | Branches stale >30d: N
 Obsidian todos: N (chronic rollover: N)
 
-Not covered: <any source that errored>
-```
+Not covered: (any source that errored)
 
 **Sorting within each quadrant**: Manager/PM items first -> then by deadline (soonest) -> then by staleness (most stale).
 
