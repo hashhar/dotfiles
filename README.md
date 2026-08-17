@@ -21,7 +21,8 @@ My dotfiles, managed with [chezmoi](https://chezmoi.io).
 |------|-------------|
 | `dot_claude/` | Claude Code settings, statusline script, and skills |
 | `dot_config/git/` | Git config with per-context identity routing via `includeIf` |
-| `dot_local/bin/` | Personal scripts (branch cleanup, PR comments, transcript extraction) |
+| `dot_local/bin/` | Personal scripts (branch cleanup, PR comments, transcript extraction, Claude theme sync) |
+| `dot_zshrc` | zsh config: Claude wrapper, tool init (sdkman/jenv/gcloud/fzf/liquidprompt) |
 
 ## License
 

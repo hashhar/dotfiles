@@ -1,0 +1,17 @@
+#!/bin/bash
+dark_mode=$(osascript -e 'tell application "System Events" to tell appearance preferences to return dark mode')
+if [ "$dark_mode" = "true" ]; then
+  theme="dark"
+else
+  theme="light"
+fi
+
+python3 -c "
+import json, os
+path = os.path.expanduser('~/.claude.json')
+with open(path) as f:
+    cfg = json.load(f)
+cfg['theme'] = '$theme'
+with open(path, 'w') as f:
+    json.dump(cfg, f, indent=2)
+"
