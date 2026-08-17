@@ -51,15 +51,27 @@
 	log = true
 	tool = vscode
 	renameLimit = 0
+	# Show the merge base alongside both sides in conflict markers.
+	conflictStyle = zdiff3
 [mergetool "vscode"]
-	cmd = code --wait $MERGED
+	cmd = code --wait --merge $REMOTE $LOCAL $BASE $MERGED
+[rerere]
+	# Record conflict resolutions and replay them. Pays for itself when a stacked
+	# branch is rebased more than once. Replayed resolutions are left unstaged
+	# deliberately, so a wrong one recorded earlier cannot slip through unreviewed.
+	enabled = true
 [pack]
 	threads = 0
 [push]
 	default = simple
 	recurseSubmodules = check
+	# No more `--set-upstream` on the first push of a branch.
+	autoSetupRemote = true
 [rebase]
 	missingCommitsCheck = warn
+	autoStash = true
+	# Move every branch ref in a stack, not just the one being rebased.
+	updateRefs = true
 [status]
 	submoduleSummary = true
 [alias]
