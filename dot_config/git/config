@@ -31,8 +31,17 @@
 	algorithm = histogram
 	wsErrorHighlight = old,new,context
 	tool = vscode
+	# Distinguish moved code from added/removed code when reviewing refactors.
+	colorMoved = zebra
+	colorMovedWS = allow-indentation-change
 [difftool "vscode"]
 	cmd = code --wait --diff $LOCAL $REMOTE
+[difftool]
+	prompt = false
+# Opt-in structural diff: `git difftool -t difftastic <rev>`. Never set as
+# diff.external - that output cannot be applied as a patch and breaks `add -p`.
+[difftool "difftastic"]
+	cmd = difft "$LOCAL" "$REMOTE"
 [fetch]
 	recurseSubmodules = on-demand
 	prune = true
